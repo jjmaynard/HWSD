@@ -12,3 +12,5 @@ ByteCompile: true
 Encoding: UTF-8
 LazyData: true
 Imports: bookdown
+URL: https://github.com/jjmaynard/HWSD
+BugReports: https://github.com/jjmaynard/HWSD/issues
