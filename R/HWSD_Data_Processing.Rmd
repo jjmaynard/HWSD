@@ -1,0 +1,150 @@
+---
+title: "HWSD Data Processing"
+output: html_notebook
+---
+
+
+
+```{r}
+library(here)
+library(sp)
+library(rgdal)
+library(raster)
+library(rgeos)
+library(dplyr)
+library(tidyr)
+library(maps)
+library(stringr)
+library(purrr)
+library(sf)
+library(data.table)
+library(ggplot2)
+library(spex)
+library(smoothr)
+library(rmapshaper)
+library(mapedit)
+library(rasterVis)
+library(utils)
+library(foreach)
+library(doParallel)
+no_cores <- detectCores() - 1  
+cl <- makeCluster(no_cores, type="SOCK", outfile = "")  
+registerDoParallel(cl)  
+getDoParWorkers()
+```
+
+
+```{r}
+#Load in HWSD .bil file downloaded from IIASA
+hwsd <- raster(here("analysis", "data", "raw_data", "HWSD_raster", "hwsd.bil"))
+proj4string(hwsd) <- "+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0"
+#hwsd[hwsd==0] <- NA
+
+#Mask out all pixels where ISSOIL=0
+
+# Connect to geodatabase
+HWSD_DATA_layers <- st_layers(dsn=here("analysis", "data", "raw_data", "HWSD_DATA.gdb"))
+HWSD_DATA_data <- st_read(dsn=here("analysis", "data", "raw_data", "HWSD_DATA.gdb"), layer='HWSD_DATA')
+#create list of MU_GLOBAL codes with no soil 
+hwsd_noSoil <- HWSD_DATA_data %>% filter(ISSOIL==0) %>% select("MU_GLOBAL")
+hwsd_noSoil <- hwsd_noSoil$MU_GLOBAL
+
+
+# #Load in masked HWSD raster
+# hwsd_mask <- raster("R:/ARS_Data/Research_Projects/LandPKS/R_Projects/HWSD/analysis/data/raw_data/HWSD_raster/hwsd_country_mask.tif")
+
+#path to 
+hwsd.path = here("analysis", "data", "raw_data", "HWSD_raster", "hwsd.bil")
+hwsdInfo <- rgdal::GDALinfo(hwsd.path)
+#load in countries shapefile to clip tiles
+countries <- st_read(here("analysis", "data", "raw_data", "Country_Shape", "Country.shp"))
+tiles.pol <- GSIF::getSpatialTiles(hwsdInfo, block.x=10, return.SpatialPolygons = TRUE)
+tiles_sf <- st_as_sf(tiles.pol)
+tiles_clip <- st_intersects(tiles_sf, countries)
+tiles_sf_clip <- tiles_sf[-c(which(rapply(tiles_clip, function(x) is_empty(x), how = 'unlist'))),]
+
+
+HWSD_poly_tiles <- list(list())
+#Progress combine function
+n <- 30
+pb <- txtProgressBar(min = 1, max = n, style=3)
+
+#Run getSoilLocationBasedUS and save results to MySQL database. Only run once.
+stime1 <- system.time({ 
+HWSD_poly_tiles <- foreach(i= 1:30, .packages = c("raster", "spex", "smoothr", "dplyr", "sf")) %dopar% {
+    setTxtProgressBar(pb, i)
+    hwsd.crop <- crop(hwsd, raster::extent(tiles_sf_clip[i,]))
+    hwsd.crop[hwsd.crop==0] <- NA
+    tryCatch({
+        HWSD_poly_tiles[[i]] <- spex::polygonize(hwsd.crop, na.rm = TRUE) %>% dplyr::group_by(hwsd) %>% dplyr::summarise() %>% st_set_crs(4326)
+    }, error=function(e){
+        HWSD_poly_tiles[[i]] <- rasterToPolygons(hwsd.crop, n=4, na.rm=TRUE, dissolve=TRUE) %>% st_as_sf() %>% st_set_crs(4326)
+    })
+}
+close(pb)
+})[3]
+stime1
+
+saveRDS(HWSD_poly_tiles, here("analysis", "data", "raw_data", "HWSD_poly_tiles.rds"))
+
+
+stime2 <- system.time({ 
+HWSD_poly <- mapedit:::combine_list_of_sf(HWSD_poly_tiles) %>% group_by(hwsd) %>% summarise() %>% smooth(., method = "chaikin")  %>% ms_simplify(., keep = 0.02, keep_shapes = TRUE)
+})[3]
+stime2
+
+
+
+
+
+
+
+
+#Crop sample area used in the Rossiter tutorial
+hwsd.zhnj <- crop(hwsd, extent(c(117.5, 119.5, 31, 33)))
+
+#Raster to vector conversion using 'spec' package and polygon smoothing using the smoothr package
+hwsd.zhnj.poly <- polygonize(hwsd.zhnj, na.rm = TRUE) %>% group_by(hwsd) %>% summarise() %>% smooth(., method = "chaikin")
+hwsd.zhnj.poly2 <- polygonize(hwsd.zhnj, na.rm = TRUE) %>% group_by(hwsd) %>% summarise() %>% smooth(., method = "spline")
+
+#rasterToPolygons is very slow compared to polygonize function
+hwsd.zhnj.poly.r <- rasterToPolygons(hwsd.zhnj, n=4, na.rm=TRUE, dissolve=TRUE) %>% smooth(., method = "chaikin") %>% st_as_sf()
+
+# Connect to geodatabase
+HWSD_DATA_layers <- st_layers(dsn=here("analysis", "data", "raw_data", "HWSD_DATA.gdb"))
+HWSD_META_layers <- st_layers(dsn=here("analysis", "data", "raw_data", "HWSD_META.gdb"))
+
+HWSD_DATA_SMU <- st_read(dsn=here("analysis", "data", "raw_data", "HWSD_DATA.gdb"), layer='HWSD_SMU')
+HWSD_DATA_data <- st_read(dsn=here("analysis", "data", "raw_data", "HWSD_DATA.gdb"), layer='HWSD_DATA')
+HWSD_DATA_FAO90 <- st_read(dsn=here("analysis", "data", "raw_data", "HWSD_DATA.gdb"), layer='D_SYMBOL90')
+HWSD_DATA_FAO74 <- st_read(dsn=here("analysis", "data", "raw_data", "HWSD_DATA.gdb"), layer='D_SYMBOL74')
+
+hwsd_smu <- hwsd %>% left_join(HWSD_DATA_SMU,  by = c("GRIDCODE" = "MU_GLOBAL"))
+
+plot(hwsd_smu['COVERAGE'], border=NA, graticule = TRUE, key.pos = NULL, axes = TRUE, xlim=c(-180, 180), ylim=c(-55.98333, 83.62351))
+
+
+ggplot() +
+    geom_sf(data = hwsd_smu, aes(fill = COVERAGE, lwd = 0)) 
+
+
+ggplot() +
+    geom_sf(data = hwsd_smu) +
+  geom_polygon(aes(fill = COVERAGE), color = NA) + 
+  coord_fixed(1.3)
+```
+```{r}
+library(tmap)
+
+tm_shape(hwsd_smu) +
+    tm_polygons("COVERAGE") + tm_borders(col=NA)
+
+qtm(hwsd_smu, fill = "COVERAGE", fill.pallete = "RdYlGn", borders = NA)
+
+```
+
+```{r}
+#save.image(here("R", "HWSD.RData"))
+load(here("R", "HWSD.RData"))
+```
+
